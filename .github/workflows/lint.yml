@@ -59,5 +59,11 @@ jobs:
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
+      # The product runs this on an image with Node baked in; ghcr.io/actions/actions-runner
+      # has none, and the step below is an npm script, so without this it is
+      # "npm: command not found". No install — nothing here needs node_modules.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
       - name: Run Deno unit tests
         run: npm run test:functions
