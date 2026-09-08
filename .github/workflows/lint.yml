@@ -1,4 +1,21 @@
 name: Lint
+
+# Handout copy of the product's lint lane. `pawtograder/platform` runs eight more
+# workflows on a push; they are deleted on this branch, not disabled, because
+# deploy.yml triggers on pull_request_target and checks out the PR head, which on a
+# repo that takes pull requests from a class is a way to run submitted code with the
+# base repo's token. The rest (preview environments, image publishing, a11y and
+# Playwright suites) need cluster credentials and self-hosted labels this org has no
+# reason to hold.
+#
+# What survives is the part a submission can actually break: lint + prettier, and the
+# Deno tests over supabase/functions, which is where a stale SupabaseTypes.d.ts shows
+# up if you skip `npm run client-local` after writing a migration.
+#
+# `ripley-cloud` is the org-scoped ARC scale set for neu-cs4535 (see
+# apps/arc/values-neu-cs4535.yaml in the k8s repo). It is sized for `npm ci` plus a
+# static-site build; this repo's node_modules is ~4.5 GB against an 8 Gi tmpfs
+# workspace, so the lint job is the one to watch if runs start dying.
 permissions:
   contents: read
 on:
@@ -10,7 +27,7 @@ on:
       - "**"
 jobs:
   lint:
-    runs-on: pawtograder-ci
+    runs-on: ripley-cloud
     strategy:
       matrix:
         node-version: [22.x]
@@ -32,84 +49,11 @@ jobs:
       - name: Run linting check
         run: npm run lint
 
-  # Jest unit tests (tests/unit).
-  #
-  # These were previously UNGATED. CI's only Jest invocation was in deploy.yml:
-  #   npx jest --runInBand --testPathPatterns "tests/unit/issue"
-  # which matches `tests/unit/issue*` only — so every other file under tests/unit
-  # ran nowhere. That was discovered on PR #956 when a stale expectation
-  # (`Expected: 8, Received: 3`, after the isolate-lifetime fallback landed) sat
-  # failing while CI stayed green, and ~117 tests across two PRs turned out to be
-  # green-by-omission. Widening the deploy.yml pattern was the other option, but
-  # that job needs a live Supabase and takes ~30 min; these are pure-logic tests
-  # that want fast feedback, so they get their own lane next to deno-unit-tests.
-  #
-  # No RUN_SUPABASE_INTEGRATION_TESTS here on purpose: the Supabase-backed files
-  # under tests/unit gate themselves on that flag and self-skip without it, so
-  # they stay in deploy.yml where a database actually exists.
-  jest-unit-tests:
-    runs-on: pawtograder-ci
-    strategy:
-      matrix:
-        node-version: [22.x]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Cache npm dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.npm
-          key: npm-${{ runner.os }}-node-22-${{ hashFiles('package-lock.json') }}
-          restore-keys: |
-            npm-${{ runner.os }}-node-22-
-      - name: Use Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ matrix.node-version }}
-      # `npm ci`, NOT `npm install`, and this is load-bearing. package.json has
-      # `jest: ^30.1.2`, so `npm install` drifts to 30.4.x while package-lock.json
-      # still pins a single hoisted `jest-mock@30.0.5`. jest-runtime@30.4.2 calls
-      # `moduleMocker.clearMocksOnScope()`, which 30.0.5 does not have, so every
-      # suite carrying `@jest-environment node` dies with
-      # "TypeError: this._moduleMocker.clearMocksOnScope is not a function"
-      # before running a single test — 43 suites locally. jest-runtime@30.1.2, the
-      # locked version, never calls it, so the locked pair is self-consistent.
-      # Verified by unpacking both versions. Refreshing the lockfile's jest deps
-      # would fix it at the source and is worth doing separately.
-      - name: Install dependencies
-        run: npm ci
-      # SCOPED to the suites this PR added, deliberately, rather than all of
-      # tests/unit. A repo-wide gate is the right end state but I could not
-      # verify it would be green: under the locked jest pair 11 of 101 suites
-      # still fail locally, and I could not attribute those without the repo's
-      # own jest.config.js dependencies, so turning it on repo-wide risks
-      # blocking unrelated PRs on pre-existing red. Widening it, and refreshing
-      # the lockfile's jest deps so `npm install` stops drifting, is the
-      # follow-up. Adding a file here is one line; that is the point.
-      - name: Run Jest unit tests
-        run: |
-          npx jest --runInBand \
-            tests/unit/async-worker-tuning.test.ts \
-            tests/unit/create-repo-step-timings.test.ts
-
-  # Guard-rail render tests: assert templates/validations.yaml still REFUSES a
-  # dangerous production values combination (e2e bypasses, plaintext/
-  # non-recoverable secrets, seeding, resetOnDrift, floating image tags,
-  # unauthenticated Studio). See charts/pawtograder/PRODUCTION-READINESS.md §4.
-  chart-guardrails:
-    runs-on: pawtograder-ci
-    steps:
-      - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
-        with:
-          version: v3.20.2
-      - name: Run chart guard-rail render tests
-        run: charts/pawtograder/tests/render-guardrails.sh
-
   # Fast, deterministic unit tests for the gradebook recalc computation (the math the
   # gradebook-calculations e2e fixtures exercise end-to-end through the async pipeline).
   # These run the real edge-function expression functions directly — no DB, no pipeline.
   deno-unit-tests:
-    runs-on: pawtograder-ci
+    runs-on: ripley-cloud
     steps:
       - uses: actions/checkout@v4
       - uses: denoland/setup-deno@v2
