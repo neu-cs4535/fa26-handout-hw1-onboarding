@@ -41,8 +41,11 @@ export default defineConfig({
     [
       "@argos-ci/playwright/reporter",
       {
-        // Upload to Argos on CI only.
-        uploadToArgos: !!process.env.CI,
+        // Upload to Argos on CI only, and only when a token is actually present. The handout
+        // repo's gradebook lane runs on CI with no secrets at all and keeps its screenshots as
+        // Actions artifacts, so an unconditional upload would fail the run at the reporter.
+        // Capture is unaffected either way: argosScreenshot writes the PNG regardless.
+        uploadToArgos: !!process.env.CI && !!process.env.ARGOS_TOKEN,
 
         // Set your Argos token (required if not using GitHub Actions).
         token: process.env.ARGOS_TOKEN || ""

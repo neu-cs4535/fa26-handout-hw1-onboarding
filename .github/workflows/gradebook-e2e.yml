@@ -1,0 +1,329 @@
+name: Gradebook E2E
+
+# Per-PR gradebook run for the column-groups assignment: brings up a throwaway Supabase, replays
+# every migration including the one in the pull request, seeds the `cs4535` class, and drives the
+# gradebook in a real browser. The screenshots it uploads are the grading artifact — twenty-four
+# submissions' column headers, captured under identical conditions.
+#
+# `pull_request`, NOT `pull_request_target`, and that is the whole security story. The upstream
+# e2e job needs pull_request_target because it takes ARGOS_TOKEN, so it has to run in the base
+# repo's context and gate on trust. This job takes no secrets at all: the Supabase keys below are
+# the published local-dev keys, the GitHub App key is generated on the runner and thrown away, and
+# the screenshots go to Actions artifacts rather than Argos. So fork PRs can run it with a
+# read-only token and no secret access, and nothing here needs to trust the submitter.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gradebook-e2e-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gradebook-e2e:
+    # Needs Docker (`supabase start`), so it cannot use the ripley-cloud tiers — those run without
+    # dind on purpose. See apps/arc/values-neu-cs4535-e2e.yaml in the k8s repo.
+    runs-on: ripley-cloud-e2e
+    timeout-minutes: 60
+    env:
+      # Per-run project name so two PRs building at once do not clobber each other's containers
+      # and volumes. The CLI reads this from supabase/config.toml, which is sed-edited below.
+      SUPABASE_PROJECT: cs4535-hw1-${{ github.run_id }}-${{ github.run_attempt }}
+      # Supabase's local-dev keys are deterministic — signed with the published "supabase-demo"
+      # JWT secret — so they are literals, not secrets, and writing .env.local before
+      # `supabase start` finishes lets the Next build overlap with it.
+      LOCAL_SUPABASE_URL: http://127.0.0.1:54321
+      LOCAL_SUPABASE_ANON_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0
+      LOCAL_SUPABASE_SERVICE_ROLE_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU
+      RUN_TMP: /tmp/gradebook-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+      # A known instructor address so the screenshot spec does not have to guess which of the
+      # seeded instructors to log in as.
+      FIXED_INSTRUCTOR_EMAIL: grading-instructor@cs4535.invalid
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-node-22-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            npm-${{ runner.os }}-node-22-
+
+      - name: Cache Next.js build
+        uses: actions/cache@v4
+        with:
+          path: .next/cache
+          key: nextjs-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-${{ hashFiles('**/*.[jt]s', '**/*.[jt]sx', '!**/node_modules/**') }}
+          restore-keys: |
+            nextjs-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-
+            nextjs-${{ runner.os }}-
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: supabase/setup-cli@v1
+        with:
+          # Pinned deliberately: `latest` makes runs non-reproducible, and this is the version
+          # docs/local-dev.md tells students to use.
+          version: 2.105.0
+
+      - name: Install dependencies
+        run: npm ci
+
+      # No repo secrets reach this file. The GitHub App key is generated per run and never leaves
+      # the runner; E2E_MOCK_GITHUB short-circuits the ingestion paths before anything would
+      # authenticate to GitHub. Redis and Sentry are omitted, which their helpers treat as
+      # "disabled" rather than as an error.
+      - name: Write .env.local
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUN_TMP"
+          cat > .env.local <<EOF
+          NEXT_PUBLIC_SUPABASE_URL=${LOCAL_SUPABASE_URL}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY=${LOCAL_SUPABASE_ANON_KEY}
+          SUPABASE_URL=${LOCAL_SUPABASE_URL}
+          SUPABASE_ANON_KEY=${LOCAL_SUPABASE_ANON_KEY}
+          SUPABASE_SERVICE_ROLE_KEY=${LOCAL_SUPABASE_SERVICE_ROLE_KEY}
+          ENABLE_SIGNUPS=true
+          NEXT_PUBLIC_PAWTOGRADER_WEB_URL=http://localhost:3001
+          E2E_ENABLE=true
+          E2E_MOCK_GITHUB=true
+          END_TO_END_SECRET=not-a-secret
+          EDGE_FUNCTION_SECRET=some-secret-value
+          GITHUB_APP_ID=1
+          GITHUB_OAUTH_CLIENT_ID=not-a-real-oauth-client-id
+          GITHUB_OAUTH_CLIENT_SECRET=not-a-real-oauth-client-secret
+          EOF
+          # @octokit/auth-app parses this lazily, so it only has to be a well-formed PKCS#8 key
+          # for the GitHubWrapper module to construct at load.
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+            -out "$RUN_TMP/dummy-app-key.pem" 2>/dev/null
+          KEY_ESCAPED=$(awk 'BEGIN{ORS=""} {printf "%s\\n", $0}' "$RUN_TMP/dummy-app-key.pem")
+          printf 'GITHUB_PRIVATE_KEY_STRING="%s"\n' "$KEY_ESCAPED" >> .env.local
+
+      - name: Pin supabase project_id per run
+        run: |
+          set -euo pipefail
+          sed -i.bak -E "s|^project_id = .*$|project_id = \"${SUPABASE_PROJECT}\"|" supabase/config.toml
+          grep "^project_id" supabase/config.toml
+
+      # Backgrounded so the container pulls and the migration replay overlap with the Next build.
+      # `supabase start` occasionally races its own internal restart, hence the retry with a full
+      # container/volume reset between attempts.
+      - name: Start local Supabase (background, fresh)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUN_TMP"
+          rm -f "$RUN_TMP/supabase-start.exitcode"
+          nohup bash -c '
+            reset_supabase() {
+              npx supabase stop --no-backup >/dev/null 2>&1 || true
+              docker ps -aq --filter "label=com.supabase.cli.project=${SUPABASE_PROJECT}" \
+                | xargs -r docker rm -f >/dev/null 2>&1 || true
+              docker volume ls --filter "label=com.supabase.cli.project=${SUPABASE_PROJECT}" -q \
+                | xargs -r docker volume rm >/dev/null 2>&1 || true
+            }
+            for attempt in 1 2 3; do
+              echo "=== supabase start attempt ${attempt}/3 ==="
+              reset_supabase
+              if npx supabase start -x analytics,vector; then
+                echo 0 > "${RUN_TMP}/supabase-start.exitcode"
+                exit 0
+              fi
+              echo "supabase start failed on attempt ${attempt}"
+            done
+            echo 1 > "${RUN_TMP}/supabase-start.exitcode"
+          ' > "$RUN_TMP/supabase-start.log" 2>&1 &
+
+      - name: Install Playwright browsers (background)
+        run: |
+          set -euo pipefail
+          rm -f "$RUN_TMP/playwright-install.exitcode"
+          nohup bash -c 'npx playwright install --with-deps chromium \
+            > $RUN_TMP/playwright-install.log 2>&1; \
+            echo $? > $RUN_TMP/playwright-install.exitcode' &
+
+      - name: Build Next.js (prod, port 3001)
+        env:
+          NEXT_PUBLIC_PAWTOGRADER_WEB_URL: http://localhost:3001
+        run: npm run build
+
+      - name: Wait for Playwright install
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 600); do
+            [ -f "$RUN_TMP/playwright-install.exitcode" ] && break
+            sleep 1
+          done
+          rc="$(cat "$RUN_TMP/playwright-install.exitcode" 2>/dev/null || echo timeout)"
+          if [ "$rc" != "0" ]; then
+            echo "playwright install failed (rc=$rc)"
+            cat "$RUN_TMP/playwright-install.log" || true
+            exit 1
+          fi
+
+      - name: Wait for Supabase + finalize schema
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 600); do
+            if curl -sf -o /dev/null -H "apikey: ${LOCAL_SUPABASE_ANON_KEY}" "${LOCAL_SUPABASE_URL}/rest/v1/"; then
+              break
+            fi
+            if [ -f "$RUN_TMP/supabase-start.exitcode" ] && [ "$(cat "$RUN_TMP/supabase-start.exitcode")" != "0" ]; then
+              echo 'supabase start exhausted its retries and never came up.'
+              echo 'If the failure is in a migration, it is probably the one in this pull request.'
+              echo '--- supabase-start.log ---'
+              cat "$RUN_TMP/supabase-start.log" || true
+              exit 1
+            fi
+            sleep 1
+          done
+          curl -sf -o /dev/null -H "apikey: ${LOCAL_SUPABASE_ANON_KEY}" "${LOCAL_SUPABASE_URL}/rest/v1/"
+
+          # Ephemeral Postgres: the volume dies with the job, so durability buys nothing.
+          docker exec -i "supabase_db_${SUPABASE_PROJECT}" \
+            psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U supabase_admin -d postgres \
+              -c "ALTER SYSTEM SET synchronous_commit = off" \
+              -c "ALTER SYSTEM SET fsync = off" \
+              -c "ALTER SYSTEM SET full_page_writes = off" \
+              -c "ALTER SYSTEM SET shared_buffers = '512MB'" \
+              -c "ALTER SYSTEM SET work_mem = '32MB'" \
+              -c "ALTER SYSTEM SET autovacuum = off"
+          docker restart "supabase_db_${SUPABASE_PROJECT}"
+          for i in $(seq 1 120); do
+            if curl -sf -o /dev/null -H "apikey: ${LOCAL_SUPABASE_ANON_KEY}" "${LOCAL_SUPABASE_URL}/rest/v1/"; then
+              break
+            fi
+            sleep 1
+          done
+          curl -sf -o /dev/null -H "apikey: ${LOCAL_SUPABASE_ANON_KEY}" "${LOCAL_SUPABASE_URL}/rest/v1/"
+
+          # The audit table is partitioned and inserts fail without today's partition.
+          docker exec -i "supabase_db_${SUPABASE_PROJECT}" psql -U postgres -d postgres \
+            -c "SELECT public.audit_maintain_partitions();"
+
+      # The assignment says to run `npm run client-local` after writing a migration, and warns that
+      # skipping it is the most common way the work goes wrong. This is that check: regenerate from
+      # the schema the migrations just built and see whether the committed file matches. The npm
+      # script prettier-formats its own output, so a diff here is a real difference, not whitespace.
+      - name: Check generated types match the migrated schema
+        run: |
+          set -euo pipefail
+          npm run client-local
+          if ! git diff --exit-code -- utils/supabase/SupabaseTypes.d.ts supabase/functions/_shared/SupabaseTypes.d.ts; then
+            echo '::error title=Generated types are stale::Your migration changed the schema but the committed types do not match it. Run `npm run client-local` and commit the result.'
+            exit 1
+          fi
+
+      - name: Seed the cs4535 class
+        run: npm run seed -- --template cs4535
+
+      - name: Serve Edge Functions
+        run: |
+          set -euo pipefail
+          nohup npx supabase functions serve --env-file .env.local > "$RUN_TMP/edge-functions.log" 2>&1 &
+          echo $! > "$RUN_TMP/edge-functions.pid"
+          ready=0
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:54321/functions/v1/ || true)
+            if [ -n "$code" ] && [ "$code" != "000" ]; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" != "1" ]; then
+            echo "Edge Functions never became reachable"
+            tail -n 200 "$RUN_TMP/edge-functions.log" || true
+            exit 1
+          fi
+
+      - name: Start Next.js prod server
+        run: |
+          set -euo pipefail
+          # CSP in report-only mode so Playwright's string-eval via CDP is not blocked.
+          nohup env PORT=3001 CSP_REPORT_ONLY=1 npm run start > "$RUN_TMP/next-server.log" 2>&1 &
+          echo $! > "$RUN_TMP/next-server.pid"
+          ready=0
+          for i in $(seq 1 60); do
+            if curl -sf -o /dev/null http://localhost:3001/; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" != "1" ]; then
+            echo "Next.js prod server never became reachable"
+            tail -n 200 "$RUN_TMP/next-server.log" || true
+            exit 1
+          fi
+
+      # Gradebook specs only. The rest of the suite has nothing to say about a column-groups
+      # migration and would triple the runtime.
+      - name: Run gradebook E2E
+        env:
+          BASE_URL: http://localhost:3001
+          SUPABASE_URL: ${{ env.LOCAL_SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ env.LOCAL_SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ env.LOCAL_SUPABASE_SERVICE_ROLE_KEY }}
+        # --project=chromium because only chromium is installed above; the config also defines a
+        # webkit project, and without this the run fails on a missing browser rather than a test.
+        run: |
+          npx playwright test --project=chromium \
+            tests/e2e/gradebook-column-groups.spec.ts \
+            tests/e2e/gradebook.test.tsx \
+            tests/e2e/gradebook-whatif.test.tsx \
+            tests/e2e/gradebook-calculations.test.tsx
+
+      # Flatten the Argos captures into one folder per test so the grading artifact can be
+      # unzipped and read without digging through test-results/.
+      - name: Collect screenshots
+        if: ${{ !cancelled() }}
+        run: ./scripts/e2e-collect-screenshots.sh "pr${{ github.event.pull_request.number || github.run_id }}"
+
+      - name: Upload grading screenshots
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradebook-screenshots-pr${{ github.event.pull_request.number || github.run_id }}
+          path: screenshots-pr${{ github.event.pull_request.number || github.run_id }}/
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload Playwright report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-pr${{ github.event.pull_request.number || github.run_id }}
+          path: playwright-report/
+          retention-days: 90
+
+      - name: Tail server logs on failure
+        if: failure()
+        run: |
+          echo '--- edge-functions.log ---'; tail -n 500 "$RUN_TMP/edge-functions.log" || true
+          echo '--- next-server.log ---';    tail -n 500 "$RUN_TMP/next-server.log" || true
+
+      - name: Stop background services
+        if: always()
+        run: |
+          kill "$(cat "$RUN_TMP/edge-functions.pid" 2>/dev/null)" 2>/dev/null || true
+          kill "$(cat "$RUN_TMP/next-server.pid" 2>/dev/null)" 2>/dev/null || true
+          mkdir -p server-logs
+          for c in $(docker ps --filter "label=com.supabase.cli.project=${SUPABASE_PROJECT}" --format '{{.Names}}'); do
+            docker logs "$c" > "server-logs/${c}.log" 2>&1 || true
+          done
+          cp -f "$RUN_TMP/edge-functions.log" server-logs/ 2>/dev/null || true
+          cp -f "$RUN_TMP/next-server.log" server-logs/ 2>/dev/null || true
+          cp -f "$RUN_TMP/supabase-start.log" server-logs/ 2>/dev/null || true
+          npx supabase stop --no-backup || true
+
+      - name: Upload server logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-logs-pr${{ github.event.pull_request.number || github.run_id }}
+          path: server-logs/
+          retention-days: 14
